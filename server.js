@@ -1,9 +1,32 @@
 import express from 'express'
+import fs from 'fs'
+import path from 'path'
 
 const app = express()
 app.use(express.json({ limit: '5mb' }))
 
+// ====== PERSISTENCE ======
+const DB_FILE = path.join(process.cwd(), 'events.json')
+
+// Load existing history
 let events = []
+try {
+  if (fs.existsSync(DB_FILE)) {
+    events = JSON.parse(fs.readFileSync(DB_FILE))
+    console.log("Loaded previous events:", events.length)
+  }
+} catch (err) {
+  console.log("No previous history found")
+}
+
+// Safe save function
+function saveEvents() {
+  try {
+    fs.writeFileSync(DB_FILE, JSON.stringify(events, null, 2))
+  } catch (err) {
+    console.error("Failed to save events:", err)
+  }
+}
 
 // ==== MALWARE PATTERNS ====
 const SUSPICIOUS = [
@@ -17,38 +40,22 @@ const SUSPICIOUS = [
 // ===== DETECT AUTH METHOD =====
 function detectAuthMethod(body, headers) {
 
-  // 1. GitHub App
   if (body.installation?.id) {
-    return {
-      type: "GitHub App",
-      id: body.installation.id
-    }
+    return { type: "GitHub App", id: body.installation.id }
   }
 
-  // 2. GitHub Actions
   if (body.sender?.login?.includes("github-actions")) {
-    return {
-      type: "GitHub Actions",
-      id: "GITHUB_TOKEN"
-    }
+    return { type: "GitHub Actions", id: "GITHUB_TOKEN" }
   }
 
-  // 3. Deploy Key / SSH
   if (body.pusher?.name === "deploy key") {
-    return {
-      type: "Deploy Key / SSH",
-      id: "ssh-key"
-    }
+    return { type: "Deploy Key / SSH", id: "ssh-key" }
   }
 
-  // 4. OAuth Apps (VS Code / GCM)
   const agent = headers["user-agent"] || ""
 
   if (agent.includes("GitHub-Hookshot")) {
-    return {
-      type: "GitHub Web",
-      id: "web-ui"
-    }
+    return { type: "GitHub Web", id: "web-ui" }
   }
 
   if (
@@ -56,17 +63,10 @@ function detectAuthMethod(body, headers) {
     agent.includes("vscode") ||
     agent.includes("GitCredential")
   ) {
-    return {
-      type: "OAuth / VS Code / Credential Manager",
-      id: "oauth"
-    }
+    return { type: "OAuth / VS Code / Credential Manager", id: "oauth" }
   }
 
-  // 5. Default → Personal Token or Stored Credential
-  return {
-    type: "Personal Token / HTTPS Credential",
-    id: "pat-unknown"
-  }
+  return { type: "Personal Token / HTTPS Credential", id: "pat-unknown" }
 }
 
 // ===== FORENSIC ANALYSIS =====
@@ -80,12 +80,10 @@ function analyzeCommitForensics(commit, body) {
 
   const pusher = body.pusher?.name
 
-  // 1. Author vs Pusher mismatch
   if (author && pusher && author !== pusher) {
     findings.push("AUTHOR_PUSHER_MISMATCH")
   }
 
-  // 2. Time manipulation
   const commitTime = new Date(commit?.timestamp)
   const pushTime   = new Date(body.repository?.updated_at)
 
@@ -96,12 +94,10 @@ function analyzeCommitForensics(commit, body) {
     findings.push("TIME_MANIPULATION")
   }
 
-  // 3. Forced update
   if (body.forced === true) {
     findings.push("FORCE_PUSH")
   }
 
-  // 4. Amend style commit
   if (/amend/i.test(commit?.message || "")) {
     findings.push("AMEND_USED")
   }
@@ -119,10 +115,8 @@ app.post('/git-monitor', (req, res) => {
   const sender = body.sender?.login
   const senderType = body.sender?.type
 
-  // ===== AUTH METHOD =====
   const auth = detectAuthMethod(body, req.headers)
 
-  // ===== COMMIT INFO =====
   let files = []
   let message = ""
   let forensicFindings = []
@@ -142,7 +136,6 @@ app.post('/git-monitor', (req, res) => {
 
   } catch {}
 
-  // ===== BEHAVIOR DETECTION =====
   const suspiciousFiles =
     files.filter(f =>
       SUSPICIOUS.some(s => f.includes(s))
@@ -153,28 +146,16 @@ app.post('/git-monitor', (req, res) => {
       message.includes(s)
     )
 
-  // ===== RISK SCORE =====
   let risk = 0
 
-  if (forensicFindings.includes("FORCE_PUSH"))
-    risk += 3
+  if (forensicFindings.includes("FORCE_PUSH")) risk += 3
+  if (forensicFindings.includes("AMEND_USED")) risk += 3
+  if (forensicFindings.includes("AUTHOR_PUSHER_MISMATCH")) risk += 4
+  if (forensicFindings.includes("TIME_MANIPULATION")) risk += 4
 
-  if (forensicFindings.includes("AMEND_USED"))
-    risk += 3
+  if (suspiciousFiles.length) risk += 5
+  if (suspiciousText.length) risk += 5
 
-  if (forensicFindings.includes("AUTHOR_PUSHER_MISMATCH"))
-    risk += 4
-
-  if (forensicFindings.includes("TIME_MANIPULATION"))
-    risk += 4
-
-  if (suspiciousFiles.length)
-    risk += 5
-
-  if (suspiciousText.length)
-    risk += 5
-
-  // PAT + spoofing = super bad
   if (
     auth.type === "Personal Token / HTTPS Credential" &&
     forensicFindings.length > 0
@@ -190,10 +171,7 @@ app.post('/git-monitor', (req, res) => {
 
     authMethod: auth,
 
-    commit: {
-      message,
-      files
-    },
+    commit: { message, files },
 
     detection: {
       suspiciousFiles,
@@ -204,17 +182,29 @@ app.post('/git-monitor', (req, res) => {
     riskScore: risk
   }
 
+  // ===== SAVE PERMANENTLY =====
   events.unshift(profile)
-  if (events.length > 200) events.pop()
+
+  if (events.length > 2000)
+    events.pop()
+
+  saveEvents()
 
   res.json({ ok: true })
+})
+
+// ===== EXPORT ENDPOINT =====
+app.get('/export', (req, res) => {
+  res.json(events)
 })
 
 // ===== UI =====
 app.get('/', (req, res) => {
 
   let html = `
-  <h2>Git Forensic Monitor v3</h2>
+  <h2>Git Forensic Monitor v3 - PERSISTENT</h2>
+
+  <a href="/export">Download JSON</a>
 
   <style>
     body{font-family:Arial;margin:20px}
@@ -267,6 +257,6 @@ app.get('/', (req, res) => {
 })
 
 app.listen(3000, () =>
-  console.log("Monitor v3 running")
+  console.log("Monitor v3 persistent running")
 )
 

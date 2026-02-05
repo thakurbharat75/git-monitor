@@ -1,129 +1,173 @@
-import express from 'express';
+import express from 'express'
+import crypto from 'crypto'
 
-const app = express();
-app.use(express.json({ limit: '5mb' }));
+const app = express()
+app.use(express.json({ limit: '5mb' }))
 
-// ===== MEMORY DB =====
-const EVENTS = [];
+let events = []
 
-// ===== PATTERNS =====
-const BAD = [
+// ======== PATTERNS YOU CARE ABOUT ========
+const SUSPICIOUS = [
   "temp_interactive_push.bat",
   "global['!']",
   "_$_1e42",
   "--no-verify",
-  "commit --amend"
-];
+  "--amend"
+]
 
-function analyze(payload) {
-  const result = { hits: [], files: [], messages: [] };
-
-  if (!payload.commits) return result;
-
-  payload.commits.forEach(c => {
-    const files = [...(c.added || []), ...(c.modified || [])];
-
-    files.forEach(f =>
-      BAD.forEach(p => {
-        if (f.includes(p)) {
-          result.hits.push(p);
-          result.files.push(f);
-        }
-      })
-    );
-
-    if (c.message) {
-      BAD.forEach(p => {
-        if (c.message.includes(p)) {
-          result.hits.push(p);
-          result.messages.push(c.message);
-        }
-      });
-    }
-  });
-
-  return result;
-}
-
-// ===== WEBHOOK ENDPOINT =====
+// ======== MAIN WEBHOOK ========
 app.post('/git-monitor', (req, res) => {
-  const body = req.body;
 
-  const event = {
-    id: Date.now(),
-    repo: body.repository?.full_name,
-    branch: body.ref?.replace('refs/heads/', ''),
-    pusher: body.pusher?.name,
-    compare: body.compare,
+  const body = req.body
+
+  const repo = body.repository?.full_name
+  const pusher = body.pusher?.name
+  const sender = body.sender?.login
+  const senderType = body.sender?.type
+  const installationId = body.installation?.id || "none"
+
+  const ip =
+    req.headers['x-forwarded-for'] ||
+    req.socket.remoteAddress
+
+  let files = []
+  let message = ""
+
+  try {
+    const commit = body.head_commit
+    message = commit?.message || ""
+
+    files = [
+      ...(commit?.added || []),
+      ...(commit?.modified || [])
+    ]
+  } catch {}
+
+  // ===== METHOD DETECTION =====
+  const isForce =
+    body.forced === true
+
+  const isAmend =
+    /amend/i.test(message)
+
+  const suspiciousFiles =
+    files.filter(f =>
+      SUSPICIOUS.some(s => f.includes(s))
+    )
+
+  const suspiciousText =
+    SUSPICIOUS.filter(s =>
+      message.includes(s)
+    )
+
+  // ===== RISK SCORE =====
+  let risk = 0
+
+  if (isForce) risk += 3
+  if (isAmend) risk += 3
+  if (suspiciousFiles.length) risk += 5
+  if (suspiciousText.length) risk += 5
+  if (senderType === "Bot") risk += 2
+
+  // ===== PROFILE =====
+  const profile = {
     time: new Date().toISOString(),
-    report: analyze(body)
-  };
+    repo,
+    pusher,
+    sender,
+    senderType,
+    installationId,
+    ip,
 
-  EVENTS.unshift(event);
-  if (EVENTS.length > 200) EVENTS.pop();
+    method: {
+      forcePush: isForce,
+      amend: isAmend,
+      viaApp: installationId !== "none",
+      senderType
+    },
 
-  res.send({ ok: true });
-});
+    commit: {
+      message,
+      files
+    },
 
-// ===== API FOR UI =====
-app.get('/incidents', (req, res) => {
-  res.json(EVENTS);
-});
+    detection: {
+      suspiciousFiles,
+      suspiciousText
+    },
 
-// ===== DASHBOARD UI =====
+    riskScore: risk
+  }
+
+  events.unshift(profile)
+  if (events.length > 200) events.pop()
+
+  console.log("==== EVENT ====")
+  console.log(profile)
+
+  res.json({ ok: true })
+})
+
+// ===== UI =====
 app.get('/', (req, res) => {
-  res.send(`
-  <html>
-  <head>
-    <title>Git Security Monitor</title>
-    <style>
-      body{font-family:Arial;margin:20px;background:#0e1117;color:white}
-      .card{background:#161b22;padding:12px;margin:10px;border-radius:6px}
-      .bad{border-left:5px solid red}
-      .ok{border-left:5px solid #2ea043}
-      a{color:#58a6ff}
-    </style>
-  </head>
 
-  <body>
-    <h2>🛡 Git Security Monitor</h2>
-    <div id="app">loading...</div>
+  let html = `
+  <h2>Git Forensic Monitor V2</h2>
 
-    <script>
-      async function load(){
-        const r = await fetch('/incidents');
-        const data = await r.json();
+  <style>
+    body{font-family:Arial;margin:20px}
+    .high{background:#ffcccc}
+    .mid{background:#fff0b3}
+    table{border-collapse:collapse;width:100%}
+    td,th{border:1px solid #ccc;padding:6px}
+  </style>
 
-        const html = data.map(e => {
-          const bad = e.report.hits.length > 0;
+  <table>
+  <tr>
+    <th>Time</th>
+    <th>Repo</th>
+    <th>Pusher</th>
+    <th>IP</th>
+    <th>Method</th>
+    <th>Risk</th>
+    <th>Findings</th>
+  </tr>
+  `
 
-          return \`
-          <div class="card \${bad ? 'bad':'ok'}">
-            <b>Repo:</b> \${e.repo}<br/>
-            <b>Branch:</b> \${e.branch}<br/>
-            <b>Pusher:</b> \${e.pusher}<br/>
-            <b>Time:</b> \${e.time}<br/>
+  for (const e of events) {
 
-            \${bad ? '<b style="color:red">🚨 ATTACK DETECTED</b><br/>' : ''}
+    const rowClass =
+      e.riskScore >= 8 ? 'high' :
+      e.riskScore >= 4 ? 'mid' : ''
 
-            <b>Files:</b> \${e.report.files.join(', ') || 'none'}<br/>
-            <b>Patterns:</b> \${e.report.hits.join(', ') || 'none'}<br/>
+    html += `
+    <tr class="${rowClass}">
+      <td>${e.time}</td>
+      <td>${e.repo}</td>
+      <td>${e.pusher}</td>
+      <td>${e.ip}</td>
 
-            \${e.compare ? '<a target="_blank" href="'+e.compare+'">View Compare</a>' : ''}
-          </div>
-          \`;
-        }).join('');
+      <td>
+        Force:${e.method.forcePush}<br/>
+        Amend:${e.method.amend}<br/>
+        App:${e.method.viaApp}<br/>
+        Type:${e.method.senderType}
+      </td>
 
-        document.getElementById('app').innerHTML = html || 'No events yet';
-      }
+      <td>${e.riskScore}</td>
 
-      load();
-      setInterval(load, 5000);
-    </script>
-  </body>
-  </html>
-  `);
-});
+      <td>
+        Files:${e.detection.suspiciousFiles.join(',')}<br/>
+        Text:${e.detection.suspiciousText.join(',')}
+      </td>
+    </tr>`
+  }
 
-app.listen(4000, () => console.log("running on 4000"));
+  html += "</table>"
+  res.send(html)
+})
+
+app.listen(3000, () =>
+  console.log("Monitor v2 running")
+)
 

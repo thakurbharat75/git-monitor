@@ -69,6 +69,46 @@ function detectAuthMethod(body, headers) {
   }
 }
 
+// ===== FORENSIC ANALYSIS =====
+function analyzeCommitForensics(commit, body) {
+
+  const findings = []
+
+  const author =
+    commit?.author?.username ||
+    commit?.author?.name
+
+  const pusher = body.pusher?.name
+
+  // 1. Author vs Pusher mismatch
+  if (author && pusher && author !== pusher) {
+    findings.push("AUTHOR_PUSHER_MISMATCH")
+  }
+
+  // 2. Time manipulation
+  const commitTime = new Date(commit?.timestamp)
+  const pushTime   = new Date(body.repository?.updated_at)
+
+  const diffMin =
+    Math.abs(pushTime - commitTime) / 60000
+
+  if (diffMin > 10) {
+    findings.push("TIME_MANIPULATION")
+  }
+
+  // 3. Forced update
+  if (body.forced === true) {
+    findings.push("FORCE_PUSH")
+  }
+
+  // 4. Amend style commit
+  if (/amend/i.test(commit?.message || "")) {
+    findings.push("AMEND_USED")
+  }
+
+  return findings
+}
+
 // ===== MAIN ENDPOINT =====
 app.post('/git-monitor', (req, res) => {
 
@@ -79,31 +119,30 @@ app.post('/git-monitor', (req, res) => {
   const sender = body.sender?.login
   const senderType = body.sender?.type
 
-  const ip =
-    req.headers['x-forwarded-for'] ||
-    req.socket.remoteAddress
-
   // ===== AUTH METHOD =====
   const auth = detectAuthMethod(body, req.headers)
 
   // ===== COMMIT INFO =====
   let files = []
   let message = ""
+  let forensicFindings = []
 
   try {
     const commit = body.head_commit
+
     message = commit?.message || ""
 
     files = [
       ...(commit?.added || []),
       ...(commit?.modified || [])
     ]
+
+    forensicFindings =
+      analyzeCommitForensics(commit, body)
+
   } catch {}
 
   // ===== BEHAVIOR DETECTION =====
-  const isForce = body.forced === true
-  const isAmend = /amend/i.test(message)
-
   const suspiciousFiles =
     files.filter(f =>
       SUSPICIOUS.some(s => f.includes(s))
@@ -117,31 +156,39 @@ app.post('/git-monitor', (req, res) => {
   // ===== RISK SCORE =====
   let risk = 0
 
-  if (isForce) risk += 3
-  if (isAmend) risk += 3
-  if (suspiciousFiles.length) risk += 5
-  if (suspiciousText.length) risk += 5
+  if (forensicFindings.includes("FORCE_PUSH"))
+    risk += 3
 
-  // PAT + amend + malware = VERY BAD
+  if (forensicFindings.includes("AMEND_USED"))
+    risk += 3
+
+  if (forensicFindings.includes("AUTHOR_PUSHER_MISMATCH"))
+    risk += 4
+
+  if (forensicFindings.includes("TIME_MANIPULATION"))
+    risk += 4
+
+  if (suspiciousFiles.length)
+    risk += 5
+
+  if (suspiciousText.length)
+    risk += 5
+
+  // PAT + spoofing = super bad
   if (
     auth.type === "Personal Token / HTTPS Credential" &&
-    (isAmend || suspiciousFiles.length)
+    forensicFindings.length > 0
   ) risk += 4
 
   const profile = {
     time: new Date().toISOString(),
+
     repo,
     pusher,
     sender,
     senderType,
-    ip,
 
     authMethod: auth,
-
-    method: {
-      forcePush: isForce,
-      amend: isAmend
-    },
 
     commit: {
       message,
@@ -150,7 +197,8 @@ app.post('/git-monitor', (req, res) => {
 
     detection: {
       suspiciousFiles,
-      suspiciousText
+      suspiciousText,
+      forensicFindings
     },
 
     riskScore: risk
@@ -166,7 +214,7 @@ app.post('/git-monitor', (req, res) => {
 app.get('/', (req, res) => {
 
   let html = `
-  <h2>Git Forensic Monitor v2.1</h2>
+  <h2>Git Forensic Monitor v3</h2>
 
   <style>
     body{font-family:Arial;margin:20px}
@@ -182,7 +230,6 @@ app.get('/', (req, res) => {
     <th>Repo</th>
     <th>Pusher</th>
     <th>Auth Method</th>
-    <th>IP</th>
     <th>Risk</th>
     <th>Findings</th>
   </tr>
@@ -205,14 +252,12 @@ app.get('/', (req, res) => {
         id: ${e.authMethod.id}
       </td>
 
-      <td>${e.ip}</td>
-
       <td>${e.riskScore}</td>
 
       <td>
         Files: ${e.detection.suspiciousFiles.join(',')}<br/>
         Text: ${e.detection.suspiciousText.join(',')}<br/>
-        Amend: ${e.method.amend}
+        Forensics: ${e.detection.forensicFindings.join(',')}
       </td>
     </tr>`
   }
@@ -222,6 +267,6 @@ app.get('/', (req, res) => {
 })
 
 app.listen(3000, () =>
-  console.log("Monitor v2.1 running")
+  console.log("Monitor v3 running")
 )
 

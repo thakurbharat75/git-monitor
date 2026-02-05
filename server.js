@@ -1,12 +1,11 @@
 import express from 'express'
-import crypto from 'crypto'
 
 const app = express()
 app.use(express.json({ limit: '5mb' }))
 
 let events = []
 
-// ======== PATTERNS YOU CARE ABOUT ========
+// ==== MALWARE PATTERNS ====
 const SUSPICIOUS = [
   "temp_interactive_push.bat",
   "global['!']",
@@ -15,7 +14,62 @@ const SUSPICIOUS = [
   "--amend"
 ]
 
-// ======== MAIN WEBHOOK ========
+// ===== DETECT AUTH METHOD =====
+function detectAuthMethod(body, headers) {
+
+  // 1. GitHub App
+  if (body.installation?.id) {
+    return {
+      type: "GitHub App",
+      id: body.installation.id
+    }
+  }
+
+  // 2. GitHub Actions
+  if (body.sender?.login?.includes("github-actions")) {
+    return {
+      type: "GitHub Actions",
+      id: "GITHUB_TOKEN"
+    }
+  }
+
+  // 3. Deploy Key / SSH
+  if (body.pusher?.name === "deploy key") {
+    return {
+      type: "Deploy Key / SSH",
+      id: "ssh-key"
+    }
+  }
+
+  // 4. OAuth Apps (VS Code / GCM)
+  const agent = headers["user-agent"] || ""
+
+  if (agent.includes("GitHub-Hookshot")) {
+    return {
+      type: "GitHub Web",
+      id: "web-ui"
+    }
+  }
+
+  if (
+    agent.includes("Visual-Studio") ||
+    agent.includes("vscode") ||
+    agent.includes("GitCredential")
+  ) {
+    return {
+      type: "OAuth / VS Code / Credential Manager",
+      id: "oauth"
+    }
+  }
+
+  // 5. Default → Personal Token or Stored Credential
+  return {
+    type: "Personal Token / HTTPS Credential",
+    id: "pat-unknown"
+  }
+}
+
+// ===== MAIN ENDPOINT =====
 app.post('/git-monitor', (req, res) => {
 
   const body = req.body
@@ -24,12 +78,15 @@ app.post('/git-monitor', (req, res) => {
   const pusher = body.pusher?.name
   const sender = body.sender?.login
   const senderType = body.sender?.type
-  const installationId = body.installation?.id || "none"
 
   const ip =
     req.headers['x-forwarded-for'] ||
     req.socket.remoteAddress
 
+  // ===== AUTH METHOD =====
+  const auth = detectAuthMethod(body, req.headers)
+
+  // ===== COMMIT INFO =====
   let files = []
   let message = ""
 
@@ -43,12 +100,9 @@ app.post('/git-monitor', (req, res) => {
     ]
   } catch {}
 
-  // ===== METHOD DETECTION =====
-  const isForce =
-    body.forced === true
-
-  const isAmend =
-    /amend/i.test(message)
+  // ===== BEHAVIOR DETECTION =====
+  const isForce = body.forced === true
+  const isAmend = /amend/i.test(message)
 
   const suspiciousFiles =
     files.filter(f =>
@@ -67,23 +121,26 @@ app.post('/git-monitor', (req, res) => {
   if (isAmend) risk += 3
   if (suspiciousFiles.length) risk += 5
   if (suspiciousText.length) risk += 5
-  if (senderType === "Bot") risk += 2
 
-  // ===== PROFILE =====
+  // PAT + amend + malware = VERY BAD
+  if (
+    auth.type === "Personal Token / HTTPS Credential" &&
+    (isAmend || suspiciousFiles.length)
+  ) risk += 4
+
   const profile = {
     time: new Date().toISOString(),
     repo,
     pusher,
     sender,
     senderType,
-    installationId,
     ip,
+
+    authMethod: auth,
 
     method: {
       forcePush: isForce,
-      amend: isAmend,
-      viaApp: installationId !== "none",
-      senderType
+      amend: isAmend
     },
 
     commit: {
@@ -102,9 +159,6 @@ app.post('/git-monitor', (req, res) => {
   events.unshift(profile)
   if (events.length > 200) events.pop()
 
-  console.log("==== EVENT ====")
-  console.log(profile)
-
   res.json({ ok: true })
 })
 
@@ -112,7 +166,7 @@ app.post('/git-monitor', (req, res) => {
 app.get('/', (req, res) => {
 
   let html = `
-  <h2>Git Forensic Monitor V2</h2>
+  <h2>Git Forensic Monitor v2.1</h2>
 
   <style>
     body{font-family:Arial;margin:20px}
@@ -127,8 +181,8 @@ app.get('/', (req, res) => {
     <th>Time</th>
     <th>Repo</th>
     <th>Pusher</th>
+    <th>Auth Method</th>
     <th>IP</th>
-    <th>Method</th>
     <th>Risk</th>
     <th>Findings</th>
   </tr>
@@ -137,28 +191,28 @@ app.get('/', (req, res) => {
   for (const e of events) {
 
     const rowClass =
-      e.riskScore >= 8 ? 'high' :
-      e.riskScore >= 4 ? 'mid' : ''
+      e.riskScore >= 10 ? 'high' :
+      e.riskScore >= 5 ? 'mid' : ''
 
     html += `
     <tr class="${rowClass}">
       <td>${e.time}</td>
       <td>${e.repo}</td>
       <td>${e.pusher}</td>
-      <td>${e.ip}</td>
 
       <td>
-        Force:${e.method.forcePush}<br/>
-        Amend:${e.method.amend}<br/>
-        App:${e.method.viaApp}<br/>
-        Type:${e.method.senderType}
+        ${e.authMethod.type}<br/>
+        id: ${e.authMethod.id}
       </td>
+
+      <td>${e.ip}</td>
 
       <td>${e.riskScore}</td>
 
       <td>
-        Files:${e.detection.suspiciousFiles.join(',')}<br/>
-        Text:${e.detection.suspiciousText.join(',')}
+        Files: ${e.detection.suspiciousFiles.join(',')}<br/>
+        Text: ${e.detection.suspiciousText.join(',')}<br/>
+        Amend: ${e.method.amend}
       </td>
     </tr>`
   }
@@ -168,6 +222,6 @@ app.get('/', (req, res) => {
 })
 
 app.listen(3000, () =>
-  console.log("Monitor v2 running")
+  console.log("Monitor v2.1 running")
 )
 

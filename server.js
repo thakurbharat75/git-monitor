@@ -1,32 +1,27 @@
 import express from 'express'
-import fs from 'fs'
-import path from 'path'
+import pkg from 'pg'
+
+const { Pool } = pkg
 
 const app = express()
 app.use(express.json({ limit: '5mb' }))
 
-// ====== PERSISTENCE ======
-const DB_FILE = path.join(process.cwd(), 'events.json')
+// ====== POSTGRES CONNECTION ======
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+})
 
-// Load existing history
-let events = []
-try {
-  if (fs.existsSync(DB_FILE)) {
-    events = JSON.parse(fs.readFileSync(DB_FILE))
-    console.log("Loaded previous events:", events.length)
-  }
-} catch (err) {
-  console.log("No previous history found")
-}
+// Create table once
+await pool.query(`
+CREATE TABLE IF NOT EXISTS events(
+  id SERIAL PRIMARY KEY,
+  data JSONB,
+  created TIMESTAMP DEFAULT now()
+)
+`)
 
-// Safe save function
-function saveEvents() {
-  try {
-    fs.writeFileSync(DB_FILE, JSON.stringify(events, null, 2))
-  } catch (err) {
-    console.error("Failed to save events:", err)
-  }
-}
+console.log("Postgres connected")
 
 // ==== MALWARE PATTERNS ====
 const SUSPICIOUS = [
@@ -106,7 +101,7 @@ function analyzeCommitForensics(commit, body) {
 }
 
 // ===== MAIN ENDPOINT =====
-app.post('/git-monitor', (req, res) => {
+app.post('/git-monitor', async (req, res) => {
 
   const body = req.body
 
@@ -182,27 +177,34 @@ app.post('/git-monitor', (req, res) => {
     riskScore: risk
   }
 
-  // ===== SAVE PERMANENTLY =====
-  events.unshift(profile)
-
-  if (events.length > 2000)
-    events.pop()
-
-  saveEvents()
+  // ===== SAVE TO POSTGRES =====
+  await pool.query(
+    'INSERT INTO events(data) VALUES($1)',
+    [profile]
+  )
 
   res.json({ ok: true })
 })
 
 // ===== EXPORT ENDPOINT =====
-app.get('/export', (req, res) => {
-  res.json(events)
+app.get('/export', async (req, res) => {
+  const r = await pool.query(
+    'SELECT data FROM events ORDER BY created DESC'
+  )
+  res.json(r.rows.map(x => x.data))
 })
 
 // ===== UI =====
-app.get('/', (req, res) => {
+app.get('/', async (req, res) => {
+
+  const r = await pool.query(
+    'SELECT data FROM events ORDER BY created DESC LIMIT 2000'
+  )
+
+  const events = r.rows.map(x => x.data)
 
   let html = `
-  <h2>Git Forensic Monitor v3 - PERSISTENT</h2>
+  <h2>Git Forensic Monitor v3 - POSTGRES</h2>
 
   <a href="/export">Download JSON</a>
 
@@ -257,6 +259,6 @@ app.get('/', (req, res) => {
 })
 
 app.listen(3000, () =>
-  console.log("Monitor v3 persistent running")
+  console.log("Monitor v3 postgres running")
 )
 
